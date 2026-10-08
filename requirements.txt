@@ -1,0 +1,4 @@
+pyais
+kokoro-onnx
+onnxruntime
+sounddevice

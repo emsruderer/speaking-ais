@@ -1,0 +1,860 @@
+# **Speech Generation on Hailo-8**
+
+Hailo-8 is optimized for inference but can run lightweight speech generation models. Here's a comprehensive guide:
+
+## **Challenges & Solutions for Speech Generation on Hailo-8**
+
+### **Limitations:**
+- **Memory constraints** (~1.5GB total, DDR)
+- **Model size limits** (~10-30MB ideal)
+- **Limited support for autoregressive** operations
+- **No dynamic shapes** (fixed input/output sizes)
+
+### **Solutions:**
+- Use distilled/smaller models
+- Quantize aggressively (INT8/INT4)
+- Split generation into chunks
+- Use frame-by-frame processing
+
+## **Lightweight Speech Generation Models for Hailo-8**
+
+### **1. Small TTS Models**
+
+```python
+# Compact Tacotron2-like model for Hailo
+import torch
+import torch.nn as nn
+
+class HailoTacotronMicro(nn.Module):
+    """Ultra-lightweight TTS for Hailo-8"""
+    def __init__(self, num_chars=40, mel_channels=80):
+        super().__init__()
+        # Text encoder (heavily compressed)
+        self.embedding = nn.Embedding(num_chars, 128)
+        self.encoder = nn.Sequential(
+            nn.Conv1d(128, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv1d(64, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv1d(64, 32, kernel_size=3, padding=1),
+        )
+        
+        # Attention (simplified)
+        self.attention = nn.MultiheadAttention(32, num_heads=2, batch_first=True)
+        
+        # Decoder (single-step per inference)
+        self.decoder_cell = nn.GRUCell(32 + mel_channels, 128)
+        self.pre_net = nn.Sequential(
+            nn.Linear(mel_channels, 64),
+            nn.ReLU(),
+            nn.Dropout(0.1)
+        )
+        
+        # Mel prediction
+        self.mel_proj = nn.Linear(128, mel_channels)
+        
+        # Stop token prediction
+        self.stop_proj = nn.Linear(128, 1)
+    
+    def forward(self, text, mel_input=None, steps=1):
+        # For Hailo: fixed step inference
+        batch_size = text.size(0)
+        
+        # Encode text
+        text_emb = self.embedding(text).transpose(1, 2)
+        encoded = self.encoder(text_emb).transpose(1, 2)
+        
+        # Initialize
+        if mel_input is None:
+            mel_input = torch.zeros(batch_size, 1, 80)
+        
+        # Process single step
+        attn_output, _ = self.attention(encoded, encoded, encoded)
+        context = attn_output.mean(dim=1)
+        
+        # Decode single frame
+        prenet_out = self.pre_net(mel_input[:, -1])
+        decoder_input = torch.cat([context, prenet_out], dim=1)
+        decoder_hidden = self.decoder_cell(decoder_input)
+        
+        # Predict mel frame and stop token
+        mel_frame = self.mel_proj(decoder_hidden)
+        stop_token = torch.sigmoid(self.stop_proj(decoder_hidden))
+        
+        return mel_frame.unsqueeze(1), stop_token
+
+class HailoVocoder(nn.Module):
+    """Lightweight vocoder for Hailo-8"""
+    def __init__(self, mel_channels=80, audio_channels=1):
+        super().__init__()
+        self.conv_pre = nn.Conv1d(mel_channels, 64, kernel_size=3, padding=1)
+        
+        # Depthwise separable convs for efficiency
+        self.convs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv1d(64, 64, kernel_size=3, padding=1, groups=64),
+                nn.Conv1d(64, 64, kernel_size=1),
+                nn.ReLU(),
+                nn.BatchNorm1d(64)
+            ) for _ in range(4)
+        ])
+        
+        self.conv_post = nn.Conv1d(64, audio_channels, kernel_size=3, padding=1)
+        
+    def forward(self, mel):
+        x = self.conv_pre(mel)
+        for conv in self.convs:
+            residual = x
+            x = conv(x)
+            x = x + residual  # Skip connection
+        audio = self.conv_post(x)
+        return torch.tanh(audio)  # Output in [-1, 1]
+```
+
+### **2. RNN-T for Streaming Speech Generation**
+
+```python
+class HailoRNNT(nn.Module):
+    """RNN-T optimized for Hailo-8 streaming"""
+    def __init__(self, vocab_size=40, audio_dim=80, hidden_dim=128):
+        super().__init__()
+        # Audio encoder (CNN + RNN)
+        self.audio_encoder = nn.Sequential(
+            nn.Conv1d(audio_dim, 64, kernel_size=3, stride=2),
+            nn.ReLU(),
+            nn.Conv1d(64, 64, kernel_size=3),
+            nn.ReLU(),
+            nn.LSTM(64, hidden_dim, batch_first=True, bidirectional=False)
+        )
+        
+        # Text encoder
+        self.text_encoder = nn.Embedding(vocab_size, hidden_dim)
+        
+        # Joint network
+        self.joint_network = nn.Sequential(
+            nn.Linear(hidden_dim * 2, 64),
+            nn.ReLU(),
+            nn.Linear(64, vocab_size)
+        )
+    
+    def forward(self, audio_features, text_tokens, audio_lengths=None):
+        # Audio encoding
+        audio_encoded, _ = self.audio_encoder(audio_features)
+        
+        # Text encoding
+        text_encoded = self.text_encoder(text_tokens)
+        
+        # Joint computation (simplified for Hailo)
+        batch_size, audio_len, hidden = audio_encoded.shape
+        text_len = text_encoded.shape[1]
+        
+        # Expand for alignment
+        audio_expanded = audio_encoded.unsqueeze(2).expand(-1, -1, text_len, -1)
+        text_expanded = text_encoded.unsqueeze(1).expand(-1, audio_len, -1, -1)
+        
+        # Concatenate and project
+        joint_input = torch.cat([audio_expanded, text_expanded], dim=-1)
+        logits = self.joint_network(joint_input)
+        
+        return logits
+```
+
+## **Deployment Pipeline**
+
+### **3. Hailo-8 Speech Generation System**
+
+```python
+import numpy as np
+from hailo_sdk_client import ClientRunner, HEF
+import queue
+import threading
+
+class HailoTTS:
+    """Text-to-Speech on Hailo-8"""
+    def __init__(self, model_paths, sample_rate=22050):
+        self.sample_rate = sample_rate
+        self.mel_channels = 80
+        self.hop_length = 256
+        
+        # Load models
+        self.text_encoder = ClientRunner(HEF(model_paths['text_encoder']))
+        self.mel_decoder = ClientRunner(HEF(model_paths['mel_decoder']))
+        self.vocoder = ClientRunner(HEF(model_paths['vocoder']))
+        
+        # Configure runners
+        self._configure_runners()
+        
+        # Buffer for streaming
+        self.audio_buffer = queue.Queue()
+        self.is_generating = False
+        
+    def _configure_runners(self):
+        """Configure Hailo runners for optimal performance"""
+        config = {
+            'batch_size': 1,
+            'scheduler_timeout_ms': 50,
+            'scheduler_threshold': 10,
+            'core_utilization': 0.7
+        }
+        
+        self.text_encoder.configure(**config)
+        self.mel_decoder.configure(**config)
+        self.vocoder.configure(**config)
+    
+    def text_to_mel_hailo(self, text, max_frames=500):
+        """Generate mel spectrogram from text on Hailo-8"""
+        # Preprocess text
+        text_tokens = self._text_to_tokens(text)
+        text_input = {'input': text_tokens}
+        
+        # Encode text
+        with self.text_encoder.inference_context() as ctx:
+            encoded_text = ctx.infer(text_input)['encoder_output']
+        
+        # Generate mel frames iteratively
+        mel_frames = []
+        stop_token = 0.0
+        
+        # Initial mel frame (silence)
+        current_mel = np.zeros((1, 1, self.mel_channels), dtype=np.float32)
+        
+        frame_count = 0
+        while frame_count < max_frames and stop_token < 0.5:
+            # Prepare decoder input
+            decoder_input = {
+                'encoded_text': encoded_text,
+                'current_mel': current_mel.astype(np.float32)
+            }
+            
+            # Generate next frame
+            with self.mel_decoder.inference_context() as ctx:
+                outputs = ctx.infer(decoder_input)
+            
+            next_mel = outputs['mel_frame']
+            stop_token = outputs['stop_token'][0][0]
+            
+            mel_frames.append(next_mel)
+            current_mel = next_mel
+            frame_count += 1
+            
+            # Periodic yield for streaming
+            if frame_count % 10 == 0 and hasattr(self, 'stream_callback'):
+                mel_chunk = np.concatenate(mel_frames[-10:], axis=1)
+                audio_chunk = self._mel_to_audio_hailo(mel_chunk)
+                self.audio_buffer.put(audio_chunk)
+        
+        # Combine all frames
+        mel_spectrogram = np.concatenate(mel_frames, axis=1)
+        return mel_spectrogram
+    
+    def _mel_to_audio_hailo(self, mel_spectrogram):
+        """Convert mel to audio using Hailo-8 vocoder"""
+        # Process in chunks for memory efficiency
+        audio_chunks = []
+        chunk_size = 80  # frames per chunk
+        
+        for i in range(0, mel_spectrogram.shape[1], chunk_size):
+            mel_chunk = mel_spectrogram[:, i:i+chunk_size, :]
+            
+            # Prepare input
+            vocoder_input = {'mel': mel_chunk.astype(np.float32)}
+            
+            # Run vocoder
+            with self.vocoder.inference_context() as ctx:
+                audio_chunk = ctx.infer(vocoder_input)['audio']
+            
+            audio_chunks.append(audio_chunk)
+        
+        # Combine audio chunks
+        audio = np.concatenate(audio_chunks, axis=1)
+        
+        # Post-processing
+        audio = self._post_process_audio(audio)
+        return audio
+    
+    def _post_process_audio(self, audio):
+        """Apply audio post-processing"""
+        # Normalize
+        audio = audio / (np.max(np.abs(audio)) + 1e-6)
+        
+        # Smooth edges
+        fade_samples = 256
+        audio[:, :fade_samples] *= np.linspace(0, 1, fade_samples)
+        audio[:, -fade_samples:] *= np.linspace(1, 0, fade_samples)
+        
+        return audio
+    
+    def stream_tts(self, text, callback=None):
+        """Stream TTS output"""
+        self.is_generating = True
+        
+        def generation_thread():
+            # Generate mel stream
+            mel_stream = self._stream_mel_generation(text)
+            
+            # Convert mel to audio stream
+            for mel_chunk in mel_stream:
+                audio_chunk = self._mel_to_audio_hailo(mel_chunk)
+                
+                if callback:
+                    callback(audio_chunk)
+                else:
+                    self.audio_buffer.put(audio_chunk)
+            
+            self.is_generating = False
+        
+        # Start generation in background thread
+        thread = threading.Thread(target=generation_thread)
+        thread.start()
+        
+        # Return audio buffer for consumption
+        return self.audio_buffer
+    
+    def _stream_mel_generation(self, text):
+        """Stream mel frames as they're generated"""
+        # Similar to text_to_mel_hailo but yields chunks
+        text_tokens = self._text_to_tokens(text)
+        text_input = {'input': text_tokens}
+        
+        with self.text_encoder.inference_context() as ctx:
+            encoded_text = ctx.infer(text_input)['encoder_output']
+        
+        current_mel = np.zeros((1, 1, self.mel_channels), dtype=np.float32)
+        frame_count = 0
+        chunk_frames = []
+        
+        while frame_count < 1000:  # Max frames
+            decoder_input = {
+                'encoded_text': encoded_text,
+                'current_mel': current_mel.astype(np.float32)
+            }
+            
+            with self.mel_decoder.inference_context() as ctx:
+                outputs = ctx.infer(decoder_input)
+            
+            next_mel = outputs['mel_frame']
+            stop_token = outputs['stop_token'][0][0]
+            
+            chunk_frames.append(next_mel)
+            current_mel = next_mel
+            frame_count += 1
+            
+            # Yield chunk every 10 frames
+            if len(chunk_frames) >= 10:
+                mel_chunk = np.concatenate(chunk_frames, axis=1)
+                yield mel_chunk
+                chunk_frames = []
+            
+            if stop_token > 0.5:
+                break
+        
+        # Yield remaining frames
+        if chunk_frames:
+            mel_chunk = np.concatenate(chunk_frames, axis=1)
+            yield mel_chunk
+    
+    def _text_to_tokens(self, text):
+        """Convert text to token indices"""
+        # Simple character-based tokenization
+        chars = " abcdefghijklmnopqrstuvwxyz',.!?"
+        char_to_idx = {c: i for i, c in enumerate(chars)}
+        
+        text = text.lower()
+        tokens = [char_to_idx.get(c, 0) for c in text]
+        
+        return np.array([tokens], dtype=np.int32)
+
+# Usage
+tts = HailoTTS({
+    'text_encoder': 'models/text_encoder.har',
+    'mel_decoder': 'models/mel_decoder.har',
+    'vocoder': 'models/vocoder.har'
+})
+
+# Generate speech
+audio = tts.synthesize("Hello, this is Hailo-8 generating speech.")
+```
+
+## **Optimization Techniques for Hailo-8**
+
+### **4. Memory-Efficient Generation**
+
+```python
+class MemoryOptimizedTTS:
+    """Memory optimization for Hailo-8 speech generation"""
+    
+    @staticmethod
+    def chunked_generation(model, input_data, chunk_size=50, overlap=5):
+        """Generate long sequences in chunks"""
+        total_length = input_data.shape[1]
+        outputs = []
+        
+        for start in range(0, total_length, chunk_size - overlap):
+            end = min(start + chunk_size, total_length)
+            
+            # Get chunk
+            chunk = input_data[:, start:end, :]
+            
+            # Process on Hailo
+            chunk_output = model.process(chunk)
+            
+            # Remove overlap from previous chunk (except first)
+            if start > 0:
+                chunk_output = chunk_output[:, overlap:, :]
+            
+            outputs.append(chunk_output)
+        
+        return np.concatenate(outputs, axis=1)
+    
+    @staticmethod
+    def cache_attention(attention_weights, window_size=100):
+        """Cache attention for efficient autoregressive generation"""
+        # Implement sliding window attention
+        # This reduces memory for long sequences
+        if attention_weights.shape[1] > window_size:
+            # Keep only recent window
+            return attention_weights[:, -window_size:]
+        return attention_weights
+    
+    @staticmethod
+    def quantize_mel(mel_frames, bits=8):
+        """Quantize mel frames for reduced memory"""
+        # Dynamic range quantization
+        mel_min = mel_frames.min()
+        mel_max = mel_frames.max()
+        
+        scale = (2**bits - 1) / (mel_max - mel_min + 1e-6)
+        zero_point = -mel_min * scale
+        
+        mel_quantized = np.clip(
+            mel_frames * scale + zero_point,
+            0, 2**bits - 1
+        ).astype(np.uint8)
+        
+        return mel_quantized, scale, zero_point
+    
+    @staticmethod
+    def dequantize_mel(mel_quantized, scale, zero_point):
+        """Dequantize mel frames"""
+        return (mel_quantized.astype(np.float32) - zero_point) / scale
+```
+
+### **5. Real-time Streaming Architecture**
+
+```python
+class HailoStreamingTTS:
+    """Real-time streaming TTS on Hailo-8"""
+    
+    def __init__(self, model_path, buffer_size_ms=200, chunk_size_ms=50):
+        self.buffer_size = int(buffer_size_ms * 16)  # 16kHz
+        self.chunk_size = int(chunk_size_ms * 16)
+        
+        # Audio buffer
+        self.audio_buffer = np.zeros(self.buffer_size)
+        self.buffer_pos = 0
+        
+        # Hailo runner
+        self.runner = ClientRunner(HEF(model_path))
+        self.runner.configure(batch_size=1, scheduler_timeout_ms=10)
+        
+        # Pre-computed phoneme features
+        self.phoneme_cache = {}
+    
+    def stream_sentence(self, text, callback=None):
+        """Stream sentence with low latency"""
+        # Preprocess and cache phonemes
+        phonemes = self._text_to_phonemes(text)
+        
+        # Generate audio in chunks
+        for phoneme_chunk in self._chunk_phonemes(phonemes, chunk_duration_ms=100):
+            # Run on Hailo
+            audio_chunk = self._generate_chunk(phoneme_chunk)
+            
+            # Stream to buffer
+            self._add_to_buffer(audio_chunk)
+            
+            # Callback with available audio
+            if callback and self.buffer_pos >= self.chunk_size:
+                audio_out = self._get_from_buffer(self.chunk_size)
+                callback(audio_out)
+    
+    def _generate_chunk(self, phoneme_chunk):
+        """Generate single audio chunk"""
+        # Prepare input
+        phoneme_features = self._extract_features(phoneme_chunk)
+        
+        # Pad to fixed size for Hailo
+        if phoneme_features.shape[1] < 100:
+            pad_width = 100 - phoneme_features.shape[1]
+            phoneme_features = np.pad(
+                phoneme_features,
+                ((0, 0), (0, pad_width), (0, 0)),
+                mode='constant'
+            )
+        
+        # Run inference
+        inputs = {'phonemes': phoneme_features.astype(np.float32)}
+        
+        with self.runner.inference_context() as ctx:
+            outputs = ctx.infer(inputs)
+        
+        audio_chunk = outputs['audio'][0, :self.chunk_size]
+        return audio_chunk
+    
+    def _add_to_buffer(self, audio_chunk):
+        """Add generated audio to ring buffer"""
+        chunk_len = len(audio_chunk)
+        
+        if self.buffer_pos + chunk_len > self.buffer_size:
+            # Shift buffer
+            shift_amount = self.buffer_pos + chunk_len - self.buffer_size
+            self.audio_buffer[:-shift_amount] = self.audio_buffer[shift_amount:]
+            self.buffer_pos -= shift_amount
+        
+        self.audio_buffer[self.buffer_pos:self.buffer_pos + chunk_len] = audio_chunk
+        self.buffer_pos += chunk_len
+    
+    def _get_from_buffer(self, n_samples):
+        """Get samples from buffer"""
+        if self.buffer_pos >= n_samples:
+            audio_out = self.audio_buffer[:n_samples].copy()
+            self.audio_buffer[:-n_samples] = self.audio_buffer[n_samples:]
+            self.audio_buffer[-n_samples:] = 0
+            self.buffer_pos -= n_samples
+            return audio_out
+        return np.zeros(n_samples)
+```
+
+## **Training & Quantization for Hailo-8**
+
+### **6. Hailo-Optimized Training**
+
+```python
+def train_hailo_tts(model, train_loader, val_loader, epochs=50):
+    """Train TTS model with Hailo constraints"""
+    
+    # Quantization-aware training
+    from torch.quantization import quantize_dynamic, prepare_qat, convert
+    
+    # Prepare for QAT
+    model.qconfig = torch.quantization.get_default_qat_qconfig('fbgemm')
+    model_prepared = prepare_qat(model)
+    
+    # Hailo-specific losses
+    def hailo_aware_loss(pred, target, model):
+        # Reconstruction loss
+        recon_loss = nn.MSELoss()(pred, target)
+        
+        # Activation range penalty (for better quantization)
+        activation_penalty = 0
+        for name, module in model.named_modules():
+            if hasattr(module, 'activation'):
+                # Penalize activations outside [-6, 6]
+                activation_penalty += torch.mean(
+                    torch.clamp(torch.abs(module.activation) - 6, min=0)
+                )
+        
+        # Weight magnitude penalty
+        weight_penalty = 0
+        for param in model.parameters():
+            weight_penalty += torch.mean(torch.abs(param))
+        
+        return recon_loss + 0.01 * activation_penalty + 0.001 * weight_penalty
+    
+    # Training loop
+    for epoch in range(epochs):
+        model_prepared.train()
+        for batch in train_loader:
+            text, mel_target = batch
+            
+            # Forward with fake quantization
+            mel_pred = model_prepared(text)
+            
+            # Hailo-aware loss
+            loss = hailo_aware_loss(mel_pred, mel_target, model_prepared)
+            
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+        
+        # Convert to quantized for validation
+        if epoch % 10 == 0:
+            model_quantized = convert(model_prepared)
+            validate_hailo_model(model_quantized, val_loader)
+    
+    # Final conversion
+    model_int8 = convert(model_prepared)
+    return model_int8
+
+def validate_hailo_model(model, val_loader):
+    """Validate with Hailo-like constraints"""
+    model.eval()
+    
+    metrics = {
+        'mel_loss': [],
+        'int8_sim_score': [],
+        'memory_usage': []
+    }
+    
+    with torch.no_grad():
+        for batch in val_loader:
+            text, mel_target = batch
+            
+            # Forward pass
+            mel_pred = model(text)
+            
+            # Calculate metrics
+            metrics['mel_loss'].append(
+                nn.MSELoss()(mel_pred, mel_target).item()
+            )
+            
+            # Simulate INT8 quantization
+            mel_pred_int8 = torch.quantize_per_tensor(
+                mel_pred, scale=0.1, zero_point=0, dtype=torch.qint8
+            )
+            mel_pred_dequant = mel_pred_int8.dequantize()
+            
+            # Similarity score
+            sim_score = torch.cosine_similarity(
+                mel_pred_dequant.flatten(),
+                mel_pred.flatten(),
+                dim=0
+            ).item()
+            metrics['int8_sim_score'].append(sim_score)
+    
+    return metrics
+```
+
+## **Complete Hailo-8 TTS Pipeline**
+
+```python
+# hailo_tts_pipeline.py
+import json
+from dataclasses import dataclass
+from typing import Optional
+
+@dataclass
+class HailoTTSConfig:
+    """Configuration for Hailo-8 TTS"""
+    text_encoder_hef: str
+    mel_decoder_hef: str
+    vocoder_hef: str
+    sample_rate: int = 22050
+    mel_channels: int = 80
+    max_text_length: int = 200
+    max_mel_frames: int = 500
+    streaming: bool = True
+    chunk_size_frames: int = 10
+    cache_phonemes: bool = True
+
+class HailoTTSComplete:
+    """Complete TTS pipeline for Hailo-8"""
+    
+    def __init__(self, config: HailoTTSConfig):
+        self.config = config
+        
+        # Load all models
+        self.models = self._load_models()
+        
+        # Initialize cache
+        if config.cache_phonemes:
+            self.phoneme_cache = {}
+        
+        # Audio post-processor
+        self.post_processor = AudioPostProcessor(sample_rate=config.sample_rate)
+    
+    def _load_models(self):
+        """Load and configure Hailo models"""
+        models = {}
+        
+        model_specs = {
+            'text_encoder': {
+                'hef': self.config.text_encoder_hef,
+                'input_shape': [1, self.config.max_text_length],
+                'output_shape': [1, 256]
+            },
+            'mel_decoder': {
+                'hef': self.config.mel_decoder_hef,
+                'input_shape': [1, 1, self.config.mel_channels + 256],
+                'output_shape': [1, 1, self.config.mel_channels + 1]
+            },
+            'vocoder': {
+                'hef': self.config.vocoder_hef,
+                'input_shape': [1, 80, self.config.mel_channels],
+                'output_shape': [1, 2560, 1]  # 2560 samples at 22.05kHz = ~116ms
+            }
+        }
+        
+        for name, spec in model_specs.items():
+            hef = HEF(spec['hef'])
+            runner = ClientRunner(hef)
+            
+            # Configure for TTS
+            runner.configure(
+                batch_size=1,
+                scheduler_timeout_ms=30,
+                scheduler_threshold=5,
+                core_utilization=0.6
+            )
+            
+            models[name] = runner
+        
+        return models
+    
+    def synthesize(self, text: str, 
+                  speaker_id: Optional[int] = None,
+                  speed: float = 1.0,
+                  pitch: float = 1.0) -> np.ndarray:
+        """Full TTS synthesis"""
+        
+        # Preprocess text
+        processed_text = self.preprocess_text(text)
+        
+        if self.config.streaming:
+            return self._streaming_synthesis(
+                processed_text, speaker_id, speed, pitch
+            )
+        else:
+            return self._batch_synthesis(
+                processed_text, speaker_id, speed, pitch
+            )
+    
+    def _streaming_synthesis(self, text, speaker_id, speed, pitch):
+        """Streaming synthesis for real-time applications"""
+        # Generate phonemes
+        phonemes = self.text_to_phonemes(text)
+        
+        # Stream generation
+        audio_buffer = queue.Queue()
+        
+        def audio_callback(audio_chunk):
+            # Apply speed and pitch adjustment
+            if speed != 1.0:
+                audio_chunk = self._adjust_speed(audio_chunk, speed)
+            if pitch != 1.0:
+                audio_chunk = self._adjust_pitch(audio_chunk, pitch)
+            
+            audio_buffer.put(audio_chunk)
+        
+        # Start streaming thread
+        thread = threading.Thread(
+            target=self._stream_phonemes,
+            args=(phonemes, speaker_id, audio_callback)
+        )
+        thread.start()
+        
+        # Return generator for audio chunks
+        return self._audio_generator(audio_buffer, thread)
+    
+    def _stream_phonemes(self, phonemes, speaker_id, callback):
+        """Stream phoneme-by-phoneme generation"""
+        phoneme_features = []
+        
+        # Convert phonemes to features
+        for phoneme in phonemes:
+            if phoneme in self.phoneme_cache:
+                features = self.phoneme_cache[phoneme]
+            else:
+                features = self._extract_phoneme_features(phoneme)
+                if self.config.cache_phonemes:
+                    self.phoneme_cache[phoneme] = features
+            phoneme_features.append(features)
+        
+        # Generate audio for each phoneme
+        for features in phoneme_features:
+            # Add speaker embedding if provided
+            if speaker_id is not None:
+                speaker_embedding = self._get_speaker_embedding(speaker_id)
+                features = np.concatenate([features, speaker_embedding], axis=-1)
+            
+            # Run on Hailo
+            audio_chunk = self._generate_from_features(features)
+            callback(audio_chunk)
+    
+    def _generate_from_features(self, features):
+        """Generate audio from features using Hailo pipeline"""
+        # Step 1: Generate mel from features
+        mel_input = {
+            'phoneme_features': features.astype(np.float32),
+            'previous_mel': np.zeros((1, 1, self.config.mel_channels), 
+                                     dtype=np.float32)
+        }
+        
+        with self.models['mel_decoder'].inference_context() as ctx:
+            mel_output = ctx.infer(mel_input)
+        
+        mel_frame = mel_output['mel_frame']
+        stop_token = mel_output['stop_token']
+        
+        # Step 2: Convert mel to audio
+        if mel_frame.shape[1] >= 10:  # Wait for enough frames
+            vocoder_input = {'mel': mel_frame.astype(np.float32)}
+            
+            with self.models['vocoder'].inference_context() as ctx:
+                audio_output = ctx.infer(vocoder_input)
+            
+            return audio_output['audio']
+        
+        return np.zeros((1, 256))  # Return silence
+    
+    def _audio_generator(self, audio_buffer, thread):
+        """Generator for streaming audio"""
+        while thread.is_alive() or not audio_buffer.empty():
+            try:
+                audio_chunk = audio_buffer.get(timeout=0.1)
+                yield audio_chunk
+            except queue.Empty:
+                if not thread.is_alive():
+                    break
+        
+        # Ensure thread is joined
+        thread.join()
+
+# Usage example
+if __name__ == "__main__":
+    # Configuration
+    config = HailoTTSConfig(
+        text_encoder_hef="models/text_encoder.har",
+        mel_decoder_hef="models/mel_decoder.har",
+        vocoder_hef="models/vocoder.har",
+        streaming=True,
+        chunk_size_frames=5
+    )
+    
+    # Initialize TTS
+    tts = HailoTTSComplete(config)
+    
+    # Synthesize speech
+    print("Generating speech on Hailo-8...")
+    
+    # For streaming applications
+    audio_stream = tts.synthesize(
+        "Hello, welcome to Hailo-8 text to speech synthesis.",
+        speed=1.1,
+        pitch=1.05
+    )
+    
+    # Play or save stream
+    for audio_chunk in audio_stream:
+        # Process chunk (play, save, stream, etc.)
+        play_audio_chunk(audio_chunk)
+```
+
+## **Performance Optimization Checklist**
+
+### **For Hailo-8 Speech Generation:**
+
+1. **Model Size**: Keep under 20MB total for all components
+2. **Fixed Shapes**: Use fixed input/output dimensions
+3. **Quantization**: Use INT8 with calibration on diverse speech data
+4. **Memory**: Implement chunking for long sequences
+5. **Latency**: Target <50ms per chunk for real-time
+6. **Power**: Use Hailo's power management features
+
+### **Expected Performance:**
+- **Latency**: 20-100ms per phoneme (depending on model)
+- **Throughput**: 10-50 phonemes/second
+- **Power**: 2-3W typical
+- **Memory**: 50-200MB peak (including audio buffers)
+
+This setup enables real-time, efficient speech generation on Hailo-8, suitable for embedded applications requiring on-device TTS without cloud dependency.
