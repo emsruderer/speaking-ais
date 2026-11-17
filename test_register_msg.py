@@ -25,6 +25,11 @@ class RegisterMessageTests(unittest.TestCase):
             finally:
                 os.chdir(original_directory)
 
+    def test_message_uses_explicit_speech_engine(self):
+        speech = Mock()
+        register_msg.add_msg("Test warning", speech_api=Mock(speak=speech))
+        speech.assert_called_once_with("Test warning")
+
 
 if __name__ == "__main__":
     unittest.main()

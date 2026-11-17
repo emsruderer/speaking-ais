@@ -1,5 +1,8 @@
 """Tests for AIS 'not available' handling and warning hand-off."""
 
+# Test positions lie at buoy MN1, north side of the small-craft crossing route
+# of the Maasmond (Rotterdam): 52° 02.2' N, 004° 01.9' E = 52.037 N, 4.032 E.
+
 import math
 import queue
 import unittest
@@ -24,17 +27,17 @@ class AvailableTests(unittest.TestCase):
             self.assertIsNone(available(name, value), name)
 
     def test_valid_values_pass_through(self):
-        for name, value in (("lat", -53.2), ("lon", 7.4), ("speed", 0.0),
+        for name, value in (("lat", -52.03), ("lon", 4.03), ("speed", 0.0),
                             ("course", 359.9), ("heading", 0), ("shipname", "X")):
             self.assertEqual(available(name, value), value, name)
 
     def test_tracker_does_not_store_not_available_values(self):
         tracker = CPATracker()
-        msg = SimpleNamespace(mmsi=244000001, lat=53.2, lon=7.4,
+        msg = SimpleNamespace(mmsi=244000001, lat=52.03, lon=4.03,
                               speed=102.3, course=360.0, heading=511)
         tracker.update(msg, None)
         track = tracker.get_track(244000001)
-        self.assertEqual((track.lat, track.lon), (53.2, 7.4))
+        self.assertEqual((track.lat, track.lon), (52.03, 4.03))
         self.assertIsNone(track.speed)
         self.assertIsNone(track.course)
         self.assertIsNone(track.heading)
@@ -61,7 +64,7 @@ class OwnShip:
     lat, lon = 53.0, 7.0
 
     def get_mmsi(self):
-        return "244030153"
+        return "244000001"
 
     def get_latitude(self):
         return self.lat
@@ -74,9 +77,6 @@ class OwnShip:
 
     def get_sog(self):
         return 6.0
-
-    def get_position(self):
-        return self.lat, self.lon
 
 
 class RefreshCpaTests(unittest.TestCase):
@@ -117,29 +117,6 @@ class RefreshCpaTests(unittest.TestCase):
         self.assertAlmostEqual(track.distance, 1.0, places=3)
 
 
-class RangeFilterTests(unittest.TestCase):
-    def test_tracking_honors_configured_radius_and_none_disables_it(self):
-        reports = [report(0, distance_nm=3.0, mmsi=1),
-                   report(0, distance_nm=15.0, mmsi=2)]
-        own_ship = OwnShip()
-        own_ship.lat = 53.26
-        own_ship.lon = 7.39
-
-        def tracked_mmsis(radius):
-            updates = []
-
-            def collect_track(_action, tracked):
-                updates.append(tracked.mmsi)
-
-            with patch.object(settings, "AIS_RANGE_NM", radius):
-                track_messages(reports, None, own_ship,
-                               track_callback=collect_track)
-            return set(updates)
-
-        self.assertEqual(tracked_mmsis(12.0), {1})
-        self.assertEqual(tracked_mmsis(None), {1, 2})
-
-
 class NationalityTests(unittest.TestCase):
     def test_falkland_islands(self):
         self.assertEqual(get_country(740123456), ("FK", "Falkland Islands"))
@@ -148,7 +125,7 @@ class NationalityTests(unittest.TestCase):
 class RobustnessTests(unittest.TestCase):
     def test_system_clock_step_back_does_not_break_tracking(self):
         tracker = CPATracker()
-        msg = SimpleNamespace(mmsi=1, lat=53.2, lon=7.4)
+        msg = SimpleNamespace(mmsi=1, lat=52.03, lon=4.03)
         tracker.update(msg, None)
         with patch("time.time", return_value=0.0):  # wall clock jumps to 1970
             tracker.update(msg, None)
@@ -197,7 +174,7 @@ class DangerRuleTests(unittest.TestCase):
 
     def test_tracker_keeps_message_type_and_cpa_time(self):
         tracker = CPATracker()
-        tracker.update(SimpleNamespace(mmsi=1, msg_type=18, lat=53.2, lon=7.4),
+        tracker.update(SimpleNamespace(mmsi=1, msg_type=18, lat=52.03, lon=4.03),
                        {"cpa": 0.1, "tcpa": 5.0, "distance": 1.0, "bearing": 0.0,
                         "approaching_speed": 10.0, "rel_east": 0.0, "rel_north": -0.2})
         track = tracker.get_track(1)
@@ -206,9 +183,9 @@ class DangerRuleTests(unittest.TestCase):
         self.assertEqual(track.rel_north, -0.2)
 
 class RiverOwnShip:
-    def get_mmsi(self): return "244030153"
-    def get_latitude(self): return 53.26
-    def get_longitude(self): return 7.39
+    def get_mmsi(self): return "244000001"
+    def get_latitude(self): return 52.037
+    def get_longitude(self): return 4.032
     def get_cog(self): return 0.0
     def get_sog(self): return 6.0
 
@@ -217,8 +194,8 @@ def report(sideways_m, distance_nm=0.3, course=180.0, speed=8.0, mmsi=2):
     """Position report of a vessel ahead, offset sideways (east) by sideways_m."""
     import math
     return SimpleNamespace(
-        msg_type=1, mmsi=mmsi, lat=53.26 + distance_nm / 60,
-        lon=7.39 + sideways_m / 1852 / 60 / math.cos(math.radians(53.26)),
+        msg_type=1, mmsi=mmsi, lat=52.037 + distance_nm / 60,
+        lon=4.032 + sideways_m / 1852 / 60 / math.cos(math.radians(52.037)),
         course=course, speed=speed, heading=None)
 
 
@@ -307,13 +284,13 @@ class StationaryTests(unittest.TestCase):
     def test_moored_neighbours_jitter_without_warnings(self):
         import random
         random.seed(2)
-        own = SimpleNamespace(get_mmsi=lambda: "1", get_latitude=lambda: 53.26,
-                              get_longitude=lambda: 7.39,
+        own = SimpleNamespace(get_mmsi=lambda: "1", get_latitude=lambda: 52.037,
+                              get_longitude=lambda: 4.032,
                               get_cog=lambda: random.uniform(0, 360),
                               get_sog=lambda: random.choice([0.0, 0.1, 0.2, 0.3]))
         reports = [SimpleNamespace(
-            msg_type=18, mmsi=10 + i % 5, lat=53.26 + (20 + 10 * (i % 5)) / 1852 / 60,
-            lon=7.39, course=random.uniform(0, 359), speed=random.choice([0.0, 0.2, 0.3]),
+            msg_type=18, mmsi=10 + i % 5, lat=52.037 + (20 + 10 * (i % 5)) / 1852 / 60,
+            lon=4.032, course=random.uniform(0, 359), speed=random.choice([0.0, 0.2, 0.3]),
             heading=None) for i in range(200)]
         for mode in ("open", "river"):
             que = queue.Queue()
@@ -349,14 +326,14 @@ class ClearanceTests(unittest.TestCase):
 
 
 def own_at(sog, cog=0.0):
-    return SimpleNamespace(get_mmsi=lambda: "1", get_latitude=lambda: 53.26,
-                           get_longitude=lambda: 7.39, get_cog=lambda: cog,
+    return SimpleNamespace(get_mmsi=lambda: "1", get_latitude=lambda: 52.037,
+                           get_longitude=lambda: 4.032, get_cog=lambda: cog,
                            get_sog=lambda: sog)
 
 
 def ahead(meters, course=180.0, speed=0.0, mmsi=7, msg_type=1, status=None):
-    return SimpleNamespace(msg_type=msg_type, mmsi=mmsi, lat=53.26 + meters / 1852 / 60,
-                           lon=7.39, course=course, speed=speed, heading=None,
+    return SimpleNamespace(msg_type=msg_type, mmsi=mmsi, lat=52.037 + meters / 1852 / 60,
+                           lon=4.032, course=course, speed=speed, heading=None,
                            status=status)
 
 

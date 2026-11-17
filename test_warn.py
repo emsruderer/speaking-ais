@@ -17,7 +17,7 @@ class WarningTests(unittest.TestCase):
 
     def test_track_with_unavailable_dynamic_fields_still_warns(self):
         [urgent, details] = self.run_tracks(CPATrack(
-            mmsi=244030153, course=None, speed=None, heading=None, ship_type=200,
+            mmsi=244000001, course=None, speed=None, heading=None, ship_type=200,
             cpa=0.4, tcpa=10.0, distance=2.0, bearing=180.0, approaching_speed=4.0,
         ), nationality="Test country ")
         self.assertEqual(urgent, (
@@ -27,7 +27,7 @@ class WarningTests(unittest.TestCase):
         ))
         self.assertEqual(details, (
             "Details: a vessel from Test country, bearing one hundred eighty degrees. "
-            "MMSI two four four zero three zero one five three."
+            "MMSI two four four zero zero zero zero zero one."
         ))
 
     def test_angle_difference_wraps_around_north(self):
@@ -52,7 +52,7 @@ class WarningTests(unittest.TestCase):
 
     def test_urgent_part_first_then_details(self):
         [urgent, details] = self.run_tracks(CPATrack(
-            mmsi=244030153, speed=0.3, course=120.0, heading=200, callsign="PD1234",
+            mmsi=244000001, speed=0.3, course=120.0, heading=200, callsign="PD1234",
             shipname="JOHANNA", ship_type=70, destination="ROTTERDAM",
             cpa=0.4, tcpa=10.0,
             distance=2.0, bearing=180.0, approaching_speed=4.0,
@@ -67,7 +67,7 @@ class WarningTests(unittest.TestCase):
             "Details: a Dutch cargo vessel, making zero point three knots, on course "
             "one hundred twenty degrees, with compass heading two hundred degrees, "
             "bearing one hundred eighty degrees. Bound for rotterdam. "
-            "MMSI two four four zero three zero one five three."
+            "MMSI two four four zero zero zero zero zero one."
         ))
 
     def test_details_wait_while_another_vessel_is_due(self):
@@ -86,7 +86,7 @@ class WarningTests(unittest.TestCase):
         tracks.put(CPATrack(mmsi=1, cpa=0.4, tcpa=5.0, distance=2.0))
         newer = CPATrack(mmsi=1, cpa=0.4, tcpa=4.9, distance=1.9)
 
-        def speak(text):
+        def speak(text, _speech_api=None):
             spoken.append(text)
             if len(spoken) == 1:  # a newer report arrives while speaking
                 tracks.put(newer)
@@ -105,7 +105,7 @@ class WarningTests(unittest.TestCase):
         tracks.put(Alert("gps", "GPS position lost."))
         spoken = []
 
-        def speak(text):
+        def speak(text, _speech_api=None):
             spoken.append(text)
             if len(spoken) == 2:  # an alert arrives during the vessel warning
                 tracks.put(Alert("ais", "AIS data lost."))
@@ -121,20 +121,58 @@ class WarningTests(unittest.TestCase):
 
     def test_unsupported_callsign_characters_are_skipped(self):
         [urgent, _] = self.run_tracks(CPATrack(
-            mmsi=244030153, callsign="PD 1-2", cpa=0.4, tcpa=10.0, distance=2.0,
+            mmsi=244000001, callsign="PD 1-2", cpa=0.4, tcpa=10.0, distance=2.0,
         ))
         self.assertIn("Call sign Papa Delta one two.", urgent)
 
+    def test_german_warning_uses_german_text_and_units(self):
+        class GermanSpeech:
+            @staticmethod
+            def str_number(number):
+                return "eins" if number == 1 else str(number)
+
+            spell_alphabet = {"P": "Paula", "D": "Dora", "1": "eins"}
+
+            @staticmethod
+            def spell_callsign(callsign):
+                return " ".join(GermanSpeech.spell_alphabet[char] for char in callsign)
+
+        with patch.object(warn, "nationaliteit", return_value="Netherlands "):
+            urgent, details = warn.compose_warning(
+                CPATrack(
+                    mmsi=1, callsign="PD1", shipname="JOHANNA", ship_type=70,
+                    speed=6.0, course=120.0, cpa=0.4, tcpa=10.0, distance=2.0,
+                    bearing=180.0, approaching_speed=4.0,
+                ),
+                GermanSpeech,
+                language="de",
+            )
+        self.assertIn(
+            "Ein Schiff vom Typ Frachtschiff namens JOHANNA nähert sich", urgent
+        )
+        self.assertIn("Nächster Annäherungspunkt 741 Meter, in 10 Minuten", urgent)
+        self.assertIn("Seemeilen entfernt", urgent)
+        self.assertIn("Rufzeichen Paula Dora eins", urgent)
+        self.assertIn("Frachtschiff aus den Niederlanden", details)
+        self.assertIn("Kurs 120 Grad", details)
+        self.assertIn("MMSI eins", details)
+
+    def test_german_alert_translation(self):
+        self.assertEqual(
+            warn.localize_alert(Alert("gps", "GPS position restored."), "de"),
+            "GPS-Position wiederhergestellt.",
+        )
+
     def test_distances_at_or_above_one_nautical_mile_keep_nautical_units(self):
         [urgent, _] = self.run_tracks(CPATrack(
-            mmsi=244030153, cpa=1.25, tcpa=10.0, distance=2.75,
+            mmsi=244000001, cpa=1.25, tcpa=10.0, distance=2.75,
         ))
         self.assertIn("approach one point two five nautical miles", urgent)
         self.assertIn("two point seven five nautical miles away", urgent)
         self.assertNotRegex(urgent, r"(?<!nautical) miles\b")
 
     def test_failing_track_does_not_stop_later_warnings(self):
-        good = CPATrack(mmsi=244030153, cpa=0.4, tcpa=10.0, distance=2.0)
+        good = CPATrack(mmsi=244000001, cpa=0.4, tcpa=10.0, distance=2.0)
         with patch.object(warn, "shiptype", side_effect=[RuntimeError("boom"), "Tug"]), \
                 self.assertLogs("warn", "ERROR"):
             messages = self.run_tracks(
@@ -246,7 +284,7 @@ class ModeWordingTests(unittest.TestCase):
         self.assertIn("Closest point of approach thirty seven meters", urgent)
 
     def test_harbour_notice_once_per_vessel(self):
-        track = CPATrack(mmsi=244030153, shipname="TUG", ship_type=52, cpa=0.003,
+        track = CPATrack(mmsi=244000001, shipname="TUG", ship_type=52, cpa=0.003,
                          tcpa=1.5, distance=0.04, bearing=90.0, callsign="DC3",
                          speed=2.0, mode="harbour")
         spoken = self.speak(track, dataclasses.replace(track, mmsi=5))

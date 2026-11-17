@@ -307,5 +307,6 @@ def get_country(mmsi: int) -> typing.Tuple[str, str]:
 
 
 if __name__ == "__main__":
-	print(get_country(244030153))
+	import settings
+	print(get_country(settings.OWN_MMSI))
 

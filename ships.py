@@ -8,6 +8,7 @@ import time
 from datetime import datetime, timezone
 
 import settings
+from dead_reckoning import DeadReckoning, course_speed
 from gps_stream import (
     decode_gll,
     decode_hdt,
@@ -26,6 +27,29 @@ FIX_MODES = {
     "D": "differential (SBAS/EGNOS or DGPS); expect a few meters position error",
     "E": "estimated (dead reckoning by the GPS receiver)",
 }
+NAVIGATION_SENTENCES = {"GLL", "RMC", "VTG", "ZDA", "HDT", "HDG", "HDM", "VHW", "XDR"}
+HEEL_NAMES = {"HEEL", "ROLL"}  # XDR angle transducer names for the heel angle
+OUTAGE_REPORT_SECONDS = 30.0  # log the dead-reckoning error after longer GPS outages
+METERS_PER_NM = 1852.0
+
+
+def moved(position, course, speed, seconds):
+    """Position (lat, lon) after sailing course (degrees) at speed (knots)."""
+    lat, lon = position
+    distance_nm = speed * seconds / 3600.0
+    course = math.radians(course)
+    lat += distance_nm * math.cos(course) / 60.0
+    latitude_cosine = math.cos(math.radians(lat))
+    if abs(latitude_cosine) > 1e-12:
+        lon += distance_nm * math.sin(course) / (60.0 * latitude_cosine)
+    return lat, lon
+
+
+def distance_m(a, b):
+    """Distance in meters between two nearby (lat, lon) positions."""
+    north = (a[0] - b[0]) * 60.0
+    east = (a[1] - b[1]) * 60.0 * math.cos(math.radians(a[0]))
+    return math.hypot(north, east) * METERS_PER_NM
 
 
 def gps_utc(decoded):
@@ -47,7 +71,8 @@ def gps_utc(decoded):
 class Ship(threading.Thread):
     """Maintain own-ship navigation data, falling back to dead reckoning."""
 
-    def __init__(self, mmsi, lat, lon, course, speed, host="localhost", port=10110):
+    def __init__(self, mmsi, lat, lon, course, speed,
+                 host=settings.HOST, port=settings.PORT):
         super().__init__(name=f"Ship-{mmsi}", daemon=True)
         self.mmsi = int(mmsi)
         self.host = host
@@ -72,6 +97,10 @@ class Ship(threading.Thread):
         self.fix_mode = None
         self._last_deadreckoning_update = time.monotonic()
         self._last_position_update = self._last_deadreckoning_update
+        # the lambda lets tests patch time.monotonic
+        self.model = DeadReckoning(clock=lambda: time.monotonic())
+        self._had_fix = False
+        self._outage = None  # dead-reckoning state since the last fix
         self._update_projected_position()
         self.get_navigation()
 
@@ -142,13 +171,16 @@ class Ship(threading.Thread):
         with self._state_lock:
             return self.lon
 
-
     def _apply_navigation(self, decoded):
         """Apply fields from a decoded navigation sentence."""
         with self._state_lock:
             latitude = decoded.get("latitude")
             longitude = decoded.get("longitude")
+            self._feed_model(decoded)
             if latitude is not None and longitude is not None:
+                self._end_outage((latitude, longitude))
+                self.model.update_fix(latitude, longitude)
+                self._had_fix = True
                 self.lat = latitude
                 self.lon = longitude
                 self.deadreckoning = False
@@ -167,6 +199,8 @@ class Ship(threading.Thread):
                 course = decoded.get("course_over_ground", decoded.get("true_track"))
                 if course is not None:
                     self.cog = course % 360.0
+                if speed is not None and course is not None:
+                    self.model.update_ground(self.cog, self.sog)
 
             heading = decoded.get("heading")
             if heading is not None:
@@ -181,6 +215,36 @@ class Ship(threading.Thread):
             self._update_projected_position()
             self.navigation = self._snapshot()
             return self.navigation.copy()
+
+    def _feed_model(self, decoded):
+        """Pass heading, speed through water and heel to the dead-reckoning model."""
+        sentence = decoded.get("sentence")
+        if sentence == "HDT":
+            self.model.update_heading(true_heading=decoded.get("heading"))
+        elif sentence in ("HDG", "HDM"):
+            self.model.update_heading(magnetic_heading=decoded.get("magnetic_heading"),
+                                      sentence_variation=decoded.get("variation"))
+        elif sentence == "VHW":
+            self.model.update_stw(decoded.get("speed_through_water"))
+        elif sentence == "XDR":
+            for measurement in decoded.get("measurements", ()):
+                if (measurement["type"] == "A"
+                        and measurement["name"].upper() in HEEL_NAMES):
+                    self.model.update_heel(measurement["value"])
+
+    def _end_outage(self, fix):
+        """On a fix after dead reckoning, log how far both methods were off."""
+        outage, self._outage = self._outage, None
+        if outage is None or not outage["had_fix"]:
+            return
+        seconds = time.monotonic() - outage["start"]
+        if seconds < OUTAGE_REPORT_SECONDS:
+            return
+        log.warning(
+            "GPS back after %.0f s; dead-reckoning error: %.0f m keeping course "
+            "and speed, %.0f m with the sensor model (%s; %s)",
+            seconds, distance_m(fix, outage["simple"]), distance_m(fix, outage["model"]),
+            ", ".join(sorted(outage["sources"])), self.model.describe())
 
     def decode_gll(self, sentence: str) -> dict:
         """Decode a GLL sentence and update navigation state."""
@@ -254,9 +318,8 @@ class Ship(threading.Thread):
                     if b"$" not in raw:
                         continue  # AIS (!AIVDM) and other non-navigation lines
                     decoded = decode_line(raw.decode("ascii", "replace").strip())
-                    if decoded is not None and decoded.get("sentence") in {
-                        "GLL", "RMC", "VTG", "ZDA", "HDT",
-                    }:
+                    if (decoded is not None
+                            and decoded.get("sentence") in NAVIGATION_SENTENCES):
                         yield decoded
 
                 if len(buffer) > max_line_bytes:
@@ -269,7 +332,12 @@ class Ship(threading.Thread):
                 self._advance_dead_reckoning()
 
     def _advance_dead_reckoning(self):
-        """Advance the configured course and speed by elapsed time."""
+        """Advance the position by elapsed time while GPS is lost.
+
+        Two tracks run from the last fix: the simple one keeps the last course
+        and speed, the model one follows DeadReckoning.ground_velocity(). The
+        published state follows the model when settings.DEAD_RECKONING_SENSORS
+        is set, otherwise the simple track (the model runs in shadow)."""
         now = time.monotonic()
         with self._state_lock:
             if not self.deadreckoning:
@@ -279,17 +347,34 @@ class Ship(threading.Thread):
                 self.deadreckoning = True
             elapsed = now - self._last_deadreckoning_update
             self._last_deadreckoning_update = now
-            if elapsed <= 0 or self.sog <= 0:
+            if self._outage is None:
+                self._outage = {
+                    "start": self._last_position_update, "had_fix": self._had_fix,
+                    "simple": (self.lat, self.lon), "model": (self.lat, self.lon),
+                    "cog": self.cog, "sog": self.sog, "sources": set(), "source": "",
+                }
+            outage = self._outage
+            if elapsed <= 0:
                 return
 
-            distance_nm = self.sog * elapsed / 3600.0
-            course = math.radians(self.cog)
-            north_nm = distance_nm * math.cos(course)
-            east_nm = distance_nm * math.sin(course)
-            self.lat += north_nm / 60.0
-            latitude_cosine = math.cos(math.radians(self.lat))
-            if abs(latitude_cosine) > 1e-12:
-                self.lon += east_nm / (60.0 * latitude_cosine)
+            velocity, source = self.model.ground_velocity(now)
+            if velocity is None:
+                course, speed, source = outage["cog"], outage["sog"], "course and speed"
+            else:
+                course, speed = course_speed(velocity)
+            if source != outage["source"]:
+                log.info("Dead reckoning (%s): %s",
+                         "sensor model" if settings.DEAD_RECKONING_SENSORS else "shadow",
+                         source)
+                outage["source"] = source
+            outage["sources"].add(source)
+            outage["simple"] = moved(outage["simple"], outage["cog"], outage["sog"], elapsed)
+            outage["model"] = moved(outage["model"], course, speed, elapsed)
+            if settings.DEAD_RECKONING_SENSORS:
+                self.lat, self.lon = outage["model"]
+                self.cog, self.sog = course, speed
+            else:
+                self.lat, self.lon = outage["simple"]
             self._update_projected_position()
             self.navigation = self._snapshot()
 
@@ -357,7 +442,8 @@ class Ship(threading.Thread):
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    ship = Ship(244030153, 0.0, 0.0, 0.0, 0.0, "127.0.0.1", 10110)
+    ship = Ship(settings.OWN_MMSI, settings.OWN_START_LAT, settings.OWN_START_LON,
+                0.0, 0.0)
     ship.start()
     try:
         while True:

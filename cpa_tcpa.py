@@ -3,11 +3,11 @@ Calculate closest point of approach and time to closest point of approach
 """
 from math import atan2, cos, degrees, radians, sin, sqrt
 
-JEMGUM_LAT= 53.2644
-JEMGUM_LON = 7.3973
-JEMGUM = (JEMGUM_LAT,JEMGUM_LON)
-NORTH_POSITION = (53.27338,7.3973)
-SOUTH_POSITION = (53.25540,7.3973)
+import settings
+
+# Demo positions 0.54 NM north and south of the own start position
+NORTH_POSITION = (settings.OWN_START_LAT + 0.009, settings.OWN_START_LON)
+SOUTH_POSITION = (settings.OWN_START_LAT - 0.009, settings.OWN_START_LON)
 R = 3440.065  # Radius of earth in nautical miles
 
 def cpa_tcpa(mmsi1, lat1, lon1, cog1, sog1, mmsi2, lat2, lon2, cog2, sog2):
@@ -97,10 +97,10 @@ if __name__ == "__main__":
     print("CPA and TCPA calculations test")
     cpas_dict = {} 
     cpas_dict = {
-        "211040154": cpa_tcpa( 211040154, SOUTH_POSITION[0], SOUTH_POSITION[1],   0,  5.0,  244030153,  NORTH_POSITION[0], NORTH_POSITION[1], 180, 5.0),
-        "211040155": cpa_tcpa( 211040155, SOUTH_POSITION[0], SOUTH_POSITION[1],   0,  3.0,  244030153,  NORTH_POSITION[0], NORTH_POSITION[1],180, 3.0),
-        "211040156": cpa_tcpa( 211040156  , SOUTH_POSITION[0], SOUTH_POSITION[1],  180,  3.0,  244030153,  NORTH_POSITION[0], NORTH_POSITION[1],180, 10.0),
-        "211040157": cpa_tcpa( 211040157  , SOUTH_POSITION[0], SOUTH_POSITION[1],  180,  0.0,  244030153,  NORTH_POSITION[0], NORTH_POSITION[1],358, 0.0),
-        "211040158": cpa_tcpa( 211040158  , SOUTH_POSITION[0], SOUTH_POSITION[1],  180,  0.1,  244030153,  SOUTH_POSITION[0], SOUTH_POSITION[1],358, 0.0)
+        "211040154": cpa_tcpa( 211040154, SOUTH_POSITION[0], SOUTH_POSITION[1],   0,  5.0,  settings.OWN_MMSI,  NORTH_POSITION[0], NORTH_POSITION[1], 180, 5.0),
+        "211040155": cpa_tcpa( 211040155, SOUTH_POSITION[0], SOUTH_POSITION[1],   0,  3.0,  settings.OWN_MMSI,  NORTH_POSITION[0], NORTH_POSITION[1],180, 3.0),
+        "211040156": cpa_tcpa( 211040156  , SOUTH_POSITION[0], SOUTH_POSITION[1],  180,  3.0,  settings.OWN_MMSI,  NORTH_POSITION[0], NORTH_POSITION[1],180, 10.0),
+        "211040157": cpa_tcpa( 211040157  , SOUTH_POSITION[0], SOUTH_POSITION[1],  180,  0.0,  settings.OWN_MMSI,  NORTH_POSITION[0], NORTH_POSITION[1],358, 0.0),
+        "211040158": cpa_tcpa( 211040158  , SOUTH_POSITION[0], SOUTH_POSITION[1],  180,  0.1,  settings.OWN_MMSI,  SOUTH_POSITION[0], SOUTH_POSITION[1],358, 0.0)
     }
     show_cpas(cpas_dict)

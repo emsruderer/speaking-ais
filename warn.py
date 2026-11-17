@@ -16,8 +16,8 @@ from shipstype import shiptype
 import settings
 from queue_metrics import increment
 
-HOST = 'localhost'
-PORT = 10110
+HOST = settings.HOST
+PORT = settings.PORT
 TALKING = True
 
 NATIONALITY_ADJECTIVES = {
@@ -31,9 +31,6 @@ NATIONALITY_ADJECTIVES = {
     "Sweden": "Swedish",
     "United Kingdom": "British",
 }
-
-JEMGUM_LAT = 53.26379
-JEMGUM_LON = 7.39738
 
 log = getLogger(__name__)
 log.setLevel("INFO")
@@ -177,12 +174,34 @@ def waiting(msg):
         return called is None or time.monotonic() - called >= HARBOUR_NOTICE_SECONDS
     return is_due(msg.mmsi, msg.tcpa)
 
-def do_warn(que, activity_counter=None):
+def localize_alert(alert, language):
+    """Return a system alert in the selected announcement language."""
+    if language != "de":
+        return alert.text
+    restored = "restored" in alert.text.lower()
+    alerts = {
+        ("gps", False): "Warnung: GPS-Position verloren. Kollisionswarnungen "
+                        "verwenden die Koppelnavigation.",
+        ("gps", True): "GPS-Position wiederhergestellt.",
+        ("ais", False): "Warnung: AIS-Daten verloren. Es werden keine "
+                        "Schiffsmeldungen empfangen.",
+        ("ais", True): "AIS-Daten wiederhergestellt.",
+        ("link", False): "Warnung: GPS- und AIS-Daten verloren. Bitte die "
+                         "SignalK-Verbindung prüfen.",
+    }
+    return alerts.get((alert.kind, restored), alert.text)
+
+def do_warn(que, activity_counter=None, language="en"):
     """Load speech in the warning worker and process AIS tracks.
 
     GPS/AIS alerts are spoken first, then the most urgent vessel. A vessel's
     details follow only when no alert or other vessel warning is waiting."""
-    import speech
+    if language == "de":
+        import sprich as speech
+    elif language == "en":
+        import speech
+    else:
+        raise ValueError(f"Unsupported speech language: {language!r}")
 
     pending = {}
     stop = False
@@ -195,33 +214,68 @@ def do_warn(que, activity_counter=None):
         del pending[pending_key(msg)]
         try:
             if isinstance(msg, Alert):
-                register_msg.add_msg(msg.text)
+                register_msg.add_msg(localize_alert(msg, language), speech)
                 continue
-            details = warn_track(msg, speech)
+            details = warn_track(msg, speech, language)
             if details is None:
                 continue
             if not stop:
                 stop = collect_tracks(que, pending, activity_counter, block=False)
             if not any(waiting(item) for item in pending.values()):
-                register_msg.add_msg(details)
+                register_msg.add_msg(details, speech)
         except Exception:  # one bad track must not stop all later warnings
             log.exception("Could not issue warning for %s", getattr(msg, "mmsi", msg))
 
-def vessel_description(ship_type):
+def vessel_description(ship_type, language="en"):
     """Spoken vessel type such as 'cargo vessel', or None when the type is unknown."""
     if not ship_type:
         return None
     vessel = shiptype(ship_type).lower()
-    if vessel.startswith(("unknown", "reserved", "not available")):
+    if vessel.startswith(("unknown", "reserved", "not available")) or "reserved" in vessel:
         return None
+    if language == "de":
+        descriptions = {
+            "wing in ground": "Bodeneffektfahrzeug",
+            "fishing": "Fischereifahrzeug",
+            "towing": "Schleppfahrzeug",
+            "dredging or underwater operations": "Bagger- oder Unterwasserfahrzeug",
+            "diving operations": "Tauchfahrzeug",
+            "military": "Militärfahrzeug",
+            "sailing": "Segelschiff",
+            "pleasure craft": "Sportboot",
+            "high-speed craft": "Hochgeschwindigkeitsfahrzeug",
+            "pilot vessel": "Lotsenboot",
+            "search and rescue vessel": "Seenotrettungsschiff",
+            "tug": "Schlepper",
+            "port tender": "Hafenfahrzeug",
+            "anti-pollution vessel": "Ölbekämpfungsschiff",
+            "law enforcement vessel": "Polizeischiff",
+            "medical transport": "medizinisches Transportfahrzeug",
+            "non-combatant ship": "unbewaffnetes Schiff",
+            "passenger": "Passagierschiff",
+            "cargo": "Frachtschiff",
+            "tanker": "Tanker",
+            "other": "sonstiges Schiff",
+        }
+        base, separator, hazard = vessel.partition(", hazardous category ")
+        translated = descriptions.get(base, "sonstiges Schiff")
+        if separator:
+            translated += f", Gefahrgutkategorie {hazard.upper()}"
+        return translated
     return vessel if vessel.endswith(("vessel", "craft")) else vessel + " vessel"
 
-def distance_words(nm, speech_api, approximate=False):
+def distance_words(nm, speech_api, approximate=False, language="en"):
     """Speak a distance in meters below one nautical mile, else in nautical miles.
 
     approximate rounds meters to tens and says 'about': AIS positions can be
     9 m off for each vessel."""
     d, in_meters = nm_to_meters(nm)
+    if language == "de":
+        if in_meters and approximate:
+            return "ungefähr " + speech_api.str_number(max(10, 10 * round(d / 10))) + " Meter"
+        if in_meters:
+            return speech_api.str_number(round(d)) + " Meter"
+        return speech_api.str_number(round(d, 2)) + " Seemeilen"
     if in_meters and approximate:
         return "about " + speech_api.str_number(max(10, 10 * round(d / 10))) + " meters"
     if in_meters:
@@ -257,22 +311,25 @@ def is_fast(msg):
     return (msg.ship_type in HIGH_SPEED_CRAFT_TYPES
             or (msg.speed is not None and msg.speed > FAST_SPEED))
 
-def tcpa_words(tcpa, speech_api):
+def tcpa_words(tcpa, speech_api, language="en"):
     """Speak a tcpa in seconds below two minutes, in hours above two hours."""
     if tcpa < SECONDS_TCPA:
         seconds = max(5, 5 * round(tcpa * 60 / 5))
-        return speech_api.str_number(seconds) + " seconds"
+        unit = "Sekunden" if language == "de" else "seconds"
+        return speech_api.str_number(seconds) + " " + unit
     t, in_hours = min_to_hr(tcpa)
+    if language == "de":
+        return speech_api.str_number(round(t)) + (" Stunden" if in_hours else " Minuten")
     return speech_api.str_number(round(t)) + (" hours" if in_hours else " minutes")
 
-def identification(msg, speech_api):
+def identification(msg, speech_api, language="en"):
     """Spoken call sign, or the MMSI when the vessel sent no usable call sign."""
     spelled = spoken_callsign(msg.callsign, speech_api) if msg.callsign else None
     if spelled:
-        return "Call sign " + spelled
+        return ("Rufzeichen " if language == "de" else "Call sign ") + spelled
     return "MMSI " + spoken_mmsi(msg.mmsi, speech_api)
 
-def compose_warning(msg, speech_api):
+def compose_warning(msg, speech_api, language="en"):
     """Return (urgent, details) texts for a dangerous track.
 
     urgent:  ship type and name, CPA, TCPA, distance, approach speed and call sign.
@@ -282,53 +339,105 @@ def compose_warning(msg, speech_api):
     details: nationality, speed, course, heading, bearing, destination and MMSI."""
     approximate = msg.mode in APPROXIMATE_MODES
     cpa = msg.clearance if msg.clearance is not None else msg.cpa
-    vessel_noun = vessel_description(msg.ship_type) or "vessel"
+    german = language == "de"
+    vessel_noun = vessel_description(msg.ship_type, language) or (
+        "Schiff" if german else "vessel"
+    )
     vessel = vessel_noun if vessel_noun != "vessel" else None
     fast = is_fast(msg)
-    if fast and not vessel_noun.startswith("high-speed"):
-        vessel = "fast " + vessel_noun
-    name = (vessel or "vessel") + (" named " + msg.shipname if msg.shipname else "")
-    speed = (", at " + speech_api.str_number(round(msg.speed)) + " knots"
-             if fast and msg.speed is not None else "")
+    if german:
+        name = "Ein schnell fahrendes Schiff" if fast else "Ein Schiff"
+        if vessel_noun != "Schiff":
+            name += " vom Typ " + vessel_noun
+        if msg.shipname:
+            name += " namens " + msg.shipname
+    else:
+        if fast and not vessel_noun.startswith("high-speed"):
+            vessel = "fast " + vessel_noun
+        name = (vessel or "vessel") + (
+            " named " + msg.shipname if msg.shipname else ""
+        )
+    speed = (
+        (", mit " if german else ", at ")
+        + speech_api.str_number(round(msg.speed))
+        + (" Knoten" if german else " knots")
+        if fast and msg.speed is not None else ""
+    )
     tcpa_known = msg.tcpa is not None and math.isfinite(msg.tcpa)
 
     if tcpa_known and msg.tcpa < CLOSE_TCPA:
-        urgent = "Danger! " + name[0].upper() + name[1:] + " close" + speed
+        if german:
+            urgent = "Gefahr! " + name + " befindet sich in unmittelbarer Nähe" + speed
+        else:
+            urgent = "Danger! " + name[0].upper() + name[1:] + " close" + speed
         if msg.bearing is not None:
-            urgent += ", bearing " + speech_api.str_number(round(msg.bearing)) + " degrees"
+            urgent += (
+                ", Peilung " if german else ", bearing "
+            ) + speech_api.str_number(round(msg.bearing)) + (
+                " Grad" if german else " degrees"
+            )
         urgent += "."
         if cpa is not None:
-            urgent += (" Closest approach " + distance_words(cpa, speech_api, approximate)
-                       + " in " + tcpa_words(msg.tcpa, speech_api) + ".")
-        return urgent + " " + identification(msg, speech_api) + ".", None
+            urgent += (
+                (" Nächster Annäherungspunkt " if german else " Closest approach ")
+                + distance_words(cpa, speech_api, approximate, language)
+                + (" in " if german else " in ")
+                + tcpa_words(msg.tcpa, speech_api, language) + "."
+            )
+        return urgent + " " + identification(msg, speech_api, language) + ".", None
 
-    urgent = "An approaching " + name + speed + "."
+    urgent = name + " nähert sich" + speed + "." if german else (
+        "An approaching " + name + speed + "."
+    )
     if cpa is not None or tcpa_known:
-        urgent += " Closest point of approach"
+        urgent += " Nächster Annäherungspunkt" if german else " Closest point of approach"
         if cpa is not None:
-            urgent += " " + distance_words(cpa, speech_api, approximate)
+            urgent += " " + distance_words(cpa, speech_api, approximate, language)
         if tcpa_known:
             urgent += (", in " if cpa is not None else " in ") + tcpa_words(
-                msg.tcpa, speech_api)
+                msg.tcpa, speech_api, language)
         urgent += "."
     current = []
     if msg.distance is not None:
-        current.append(distance_words(msg.distance, speech_api, approximate) + " away")
+        current.append(
+            distance_words(msg.distance, speech_api, approximate, language)
+            + (" entfernt" if german else " away")
+        )
     if msg.approaching_speed is not None:
-        current.append("at an approach speed of "
-                       + speech_api.str_number(round(msg.approaching_speed)) + " knots")
+        current.append(
+            ("Annäherungsgeschwindigkeit " if german else "at an approach speed of ")
+            + speech_api.str_number(round(msg.approaching_speed))
+            + (" Knoten" if german else " knots")
+        )
     if current:
-        urgent += " Currently " + ", ".join(current) + "."
+        urgent += (" Derzeit " if german else " Currently ") + ", ".join(current) + "."
     if fast:
-        urgent += " " + identification(msg, speech_api) + "."
+        urgent += " " + identification(msg, speech_api, language) + "."
     else:
         spelled_callsign = (spoken_callsign(msg.callsign, speech_api)
                             if msg.callsign else None)
         if spelled_callsign:
-            urgent += " Call sign " + spelled_callsign + "."
+            urgent += (" Rufzeichen " if german else " Call sign ") + spelled_callsign + "."
 
     nationality = nationaliteit(msg.mmsi).strip()
-    if nationality in NATIONALITY_ADJECTIVES:
+    german_countries = {
+        "Belgium": "Belgien",
+        "Denmark": "Dänemark",
+        "Finland": "Finnland",
+        "France": "Frankreich",
+        "Germany": "Deutschland",
+        "Netherlands": "den Niederlanden",
+        "Norway": "Norwegen",
+        "Sweden": "Schweden",
+        "United Kingdom": "dem Vereinigten Königreich",
+    }
+    if german:
+        country = german_countries.get(nationality, nationality)
+        flag = (
+            (vessel_noun + " aus " + country)
+            if nationality and nationality != "Unknown" else None
+        )
+    elif nationality in NATIONALITY_ADJECTIVES:
         flag = "a " + NATIONALITY_ADJECTIVES[nationality] + " " + vessel_noun
     elif nationality and nationality != "Unknown":
         flag = "a " + vessel_noun + " from " + nationality
@@ -336,33 +445,61 @@ def compose_warning(msg, speech_api):
         flag = None
     facts = [flag] if flag else []
     if msg.speed is not None:
-        facts.append("making " + speech_api.str_number(msg.speed) + " knots")
+        facts.append(
+            ("Geschwindigkeit " if german else "making ")
+            + speech_api.str_number(msg.speed)
+            + (" Knoten" if german else " knots")
+        )
     if msg.course is not None:
-        facts.append("on course " + speech_api.str_number(int(msg.course)) + " degrees")
+        facts.append(
+            ("Kurs " if german else "on course ")
+            + speech_api.str_number(int(msg.course))
+            + (" Grad" if german else " degrees")
+        )
         if (msg.heading is not None and msg.heading != 511
                 and angle_difference(msg.heading, msg.course) >= 10):
-            facts.append("with compass heading "
-                         + speech_api.str_number(round(msg.heading)) + " degrees")
+            facts.append(
+                ("Kompasskurs " if german else "with compass heading ")
+                + speech_api.str_number(round(msg.heading))
+                + (" Grad" if german else " degrees")
+            )
     if msg.bearing is not None:
-        facts.append("bearing " + speech_api.str_number(round(msg.bearing)) + " degrees")
+        facts.append(
+            ("Peilung " if german else "bearing ")
+            + speech_api.str_number(round(msg.bearing))
+            + (" Grad" if german else " degrees")
+        )
     details = "Details: " + ", ".join(facts) + "." if facts else ""
     if msg.destination:
-        details += " Bound for " + msg.destination.lower() + "."
+        details += (
+            (" Zielhafen " if german else " Bound for ")
+            + msg.destination.lower() + "."
+        )
     details += " MMSI " + spoken_mmsi(msg.mmsi, speech_api) + "."
     return urgent, details.strip()
 
-def compose_harbour_notice(msg, speech_api):
+def compose_harbour_notice(msg, speech_api, language="en"):
     """Short notice for a vessel manoeuvring close to the moored own vessel."""
-    vessel = vessel_description(msg.ship_type) or "vessel"
+    german = language == "de"
+    vessel = vessel_description(msg.ship_type, language) or (
+        "Schiff" if german else "vessel"
+    )
     name = vessel[0].upper() + vessel[1:]
     if msg.shipname:
-        name += " named " + msg.shipname
-    notice = name + " manoeuvring close"
+        name += (" namens " if german else " named ") + msg.shipname
+    notice = name + (" manövriert in unmittelbarer Nähe" if german else " manoeuvring close")
     if msg.bearing is not None:
-        notice += ", bearing " + speech_api.str_number(round(msg.bearing)) + " degrees"
+        notice += (
+            (", Peilung " if german else ", bearing ")
+            + speech_api.str_number(round(msg.bearing))
+            + (" Grad" if german else " degrees")
+        )
     if msg.distance is not None:
-        notice += ", " + distance_words(msg.distance, speech_api, True) + " away"
-    return notice + ". " + identification(msg, speech_api) + "."
+        notice += (
+            ", " + distance_words(msg.distance, speech_api, True, language)
+            + (" entfernt" if german else " away")
+        )
+    return notice + ". " + identification(msg, speech_api, language) + "."
 
 def harbour_notice_due(mmsi):
     """Whether a harbour notice for mmsi may be spoken now; records it if so."""
@@ -373,7 +510,7 @@ def harbour_notice_due(mmsi):
     harbour_notices[mmsi] = current_time
     return True
 
-def warn_track(msg, speech_api):
+def warn_track(msg, speech_api, language="en"):
     """Speak the urgent part of the warning for one dangerous track when it is due.
 
     Returns the details text to speak afterwards, or None when nothing was spoken."""
@@ -386,16 +523,18 @@ def warn_track(msg, speech_api):
     if msg.mode == "harbour":
         if harbour_notice_due(msg.mmsi):
             log.info("Harbour notice for MMSI %s", msg.mmsi)
-            register_msg.add_msg(compose_harbour_notice(msg, speech_api))
+            register_msg.add_msg(
+                compose_harbour_notice(msg, speech_api, language), speech_api
+            )
         return None
-    urgent, details = compose_warning(msg, speech_api)
+    urgent, details = compose_warning(msg, speech_api, language)
     log.info("Warning generated for MMSI %s", msg.mmsi)
     if settings.VERBOSE:
         print("Bericht generated:", urgent, details)
     if not repeat_call(msg.mmsi, msg.tcpa):
         return None
     log.info("Issuing warning for MMSI %s", msg.mmsi)
-    register_msg.add_msg(urgent)  # speaks the warning without persistence
+    register_msg.add_msg(urgent, speech_api)  # speaks the warning without persistence
     return details
 
 if __name__ == '__main__':
@@ -405,8 +544,10 @@ if __name__ == '__main__':
     print("nm_to_meters(-0.5) =", nm_to_meters(-0.5) )
     print("nm_to_meters(-1.5) =", nm_to_meters(-1.5) )
     print("nm_to_meters(1.5) =", nm_to_meters(1.5) )
-    print("bearing(53.26379,7.39738,53.26300,7.40000) =", bearing(53.26379,7.39738,53.2630,7.400))
-    print("distance(53.26379,7.39738,53.26300,7.40000) =", distance(53.26379,7.39738,53.2630,7.400))
+    home = (settings.OWN_START_LAT, settings.OWN_START_LON)
+    nearby = (home[0] - 0.0008, home[1] + 0.0026)
+    print(f"bearing{home + nearby} =", bearing(*home, *nearby))
+    print(f"distance{home + nearby} =", distance(*home, *nearby))
     print("call_interval(10) =", call_interval(10) )
     print("call_interval(20) =", call_interval(20) )
     print("call_interval(30) =", call_interval(30) )

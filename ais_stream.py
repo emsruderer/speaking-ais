@@ -4,8 +4,11 @@ import dataclasses
 import logging
 import logging.handlers
 import math
+import queue as thread_queue
 import signal
+import socket
 import sys
+import threading
 from collections.abc import Callable
 from multiprocessing import Process, Queue
 from pathlib import Path
@@ -16,15 +19,16 @@ import warn
 from cpa_tcpa import cpa_tcpa
 from cpa_tracker import CPATrack, CPATracker, available, now
 from link_monitor import LinkMonitor
-from pyais.filter import FilterChain, MessageTypeFilter, NoneFilter, haversine
+from pyais.filter import FilterChain, MessageTypeFilter, NoneFilter
 from pyais.stream import TCPConnection
 from pyais.tracker import AISTrackEvent
 from queue_metrics import increment
 from ships import Ship
 
 HOST = settings.HOST
-PORT = 10110
+PORT = settings.PORT
 MAX_MESSAGES = 100
+SPEECH_LANGUAGE = "en"
 MINIMUM_CPA = 1 # nautical miles
 MINIMUM_TCPA = 30  # minutes
 MINIMUM_DISTANCE = 5 # nautical miles
@@ -42,11 +46,17 @@ METERS_PER_NM = 1852
 STATIONARY_SPEED = 0.5  # knots
 MOORED_STATUSES = (1, 5)  # AIS navigational status at anchor, moored
 MOORED_MAX_SPEED = 1.0  # knots; above this a 'moored' status is assumed stale
+OWN_SMOOTH_SECONDS = 30
+OWN_STATIONARY_SPEED = 1.0  # knots; slower averaged own speed counts as at rest
+# A vessel on a collision course must close the range. When the measured range
+# changes less than RANGE_CLOSURE_MIN_M over RANGE_WINDOW_SECONDS, the computed
+# TCPA comes from noisy speeds (GPS/AIS jitter) and no warning is given.
+RANGE_WINDOW_SECONDS = 45
+RANGE_CLOSURE_MIN_M = 20.0
 UNKNOWN_HALF_BEAM_M = 3.0  # target half beam when AIS gives no dimensions
 MANOEUVRE_SPEED = 3.0  # knots; own (and target) speed below this is manoeuvring
 MANOEUVRE_LEAVE_SPEED = 3.5  # knots; own speed that ends manoeuvring (hysteresis)
 
-print(f"Using SignalK host: {HOST}, port: {PORT}")
 
 @dataclasses.dataclass(frozen=True)
 class DangerProfile:
@@ -103,17 +113,10 @@ def danger_profile() -> DangerProfile:
                          f"use one of {', '.join(PROFILES)}") from None
 
 
-def position_in_range(lat, lon, own_lat, own_lon):
-    """Whether a position is inside the configured AIS tracking radius."""
-    radius = settings.AIS_RANGE_NM
-    if radius is None:
-        return True
-    if not math.isfinite(radius) or radius <= 0:
-        raise ValueError("settings.AIS_RANGE_NM must be positive or None")
-    return haversine((own_lat, own_lon), (lat, lon)) / 1.852 < radius
-
-
 CPA_REFRESH_SECONDS = 5  # recompute CPA of all tracks between their reports
+# A quiet stream still yields a tick this often, so CPA refreshes and stop
+# requests do not wait for the next AIS message.
+TICK_SECONDS = 1.0
 CPA_KEYS = ("cpa", "tcpa", "distance", "bearing", "approaching_speed",
             "rel_east", "rel_north")
 # SignalK also sends GPS sentences every second, so a stream silent this long is dead
@@ -255,9 +258,38 @@ def target_velocity(course, speed, status=None):
         return 0.0, 0.0
     return course, speed
 
-def own_velocity(ship):
-    """Own course and speed for CPA, stationary below STATIONARY_SPEED."""
-    return target_velocity(ship.get_cog(), ship.get_sog())
+def own_velocity(ship, smoother=None):
+    """Own course and speed for CPA, stationary below STATIONARY_SPEED.
+
+    With a smoother the velocity is averaged over OWN_SMOOTH_SECONDS and counts as
+    stationary below OWN_STATIONARY_SPEED: a moored vessel's GPS shows 0.1-1.5 kn
+    while the receiver keeps reporting its last real course, which would aim the
+    own ship at its neighbours."""
+    velocity = target_velocity(ship.get_cog(), ship.get_sog())
+    if smoother is None:
+        return velocity
+    course, speed = smoother.update(*velocity)
+    return (course, speed) if speed >= OWN_STATIONARY_SPEED else (0.0, 0.0)
+
+class OwnVelocitySmoother:
+    """Average the own velocity vector over the last seconds."""
+
+    def __init__(self, window=OWN_SMOOTH_SECONDS, clock=now):
+        self.window = window
+        self.clock = clock
+        self._history = collections.deque()
+
+    def update(self, course, speed):
+        """Add the current velocity and return the averaged (course, speed)."""
+        at_time = self.clock()
+        self._history.append((at_time, course, speed))
+        while self._history[0][0] < at_time - self.window:
+            self._history.popleft()
+        east = sum(s * math.sin(math.radians(c)) for _, c, s in self._history)
+        north = sum(s * math.cos(math.radians(c)) for _, c, s in self._history)
+        count = len(self._history)
+        return (math.degrees(math.atan2(east, north)) % 360,
+                math.hypot(east, north) / count)
 
 class ManoeuvreDetector:
     """Track whether the own vessel is manoeuvring: below MANOEUVRE_SPEED,
@@ -290,6 +322,34 @@ def track_profile(track: CPATrack, base: DangerProfile,
     if track.speed < MANOEUVRE_SPEED:
         return HARBOUR_PROFILE
     return base
+
+class RangeWatcher:
+    """Measure how much each vessel's range really shrank over the last seconds."""
+
+    def __init__(self, window=RANGE_WINDOW_SECONDS, min_closure_m=RANGE_CLOSURE_MIN_M):
+        self.window = window
+        self.min_closure_m = min_closure_m
+        self._history = collections.defaultdict(collections.deque)
+
+    def update(self, mmsi, at_time, distance_nm):
+        """Record a range (NM) at at_time (seconds)."""
+        if distance_nm is None:
+            return
+        history = self._history[mmsi]
+        history.append((at_time, distance_nm))
+        while len(history) > 1 and history[1][0] <= at_time - self.window:
+            history.popleft()
+
+    def stalled(self, mmsi, at_time):
+        """Whether the range was observed for a full window without closing."""
+        history = self._history.get(mmsi)
+        if not history or at_time - history[0][0] < self.window:
+            return False
+        closure_m = (history[0][1] - history[-1][1]) * METERS_PER_NM
+        return closure_m < self.min_closure_m
+
+    def forget(self, mmsi):
+        self._history.pop(mmsi, None)
 
 class VelocitySmoother:
     """Average each vessel's last reported velocities as vectors.
@@ -326,7 +386,8 @@ def project_position(lat, lon, course, speed, seconds):
     lon2 = lon + distance_nm * math.sin(course) / (60.0 * math.cos(math.radians(lat)))
     return lat2, lon2
 
-def refresh_cpa(tracker, known_ship, at_time, smoother=None, smooth_reports=None):
+def refresh_cpa(tracker, known_ship, at_time, smoother=None, smooth_reports=None,
+                own_smoother=None):
     """Recompute CPA data of all positioned tracks for the current own-ship state.
 
     Targets report only every few seconds to minutes (an anchored class A ship
@@ -346,7 +407,7 @@ def refresh_cpa(tracker, known_ship, at_time, smoother=None, smooth_reports=None
                                     max(0.0, at_time - track.position_time))
         result = cpa_tcpa(
             known_ship.get_mmsi(), known_ship.get_latitude(),
-            known_ship.get_longitude(), *own_velocity(known_ship),
+            known_ship.get_longitude(), *own_velocity(known_ship, own_smoother),
             track.mmsi, lat, lon, course, speed,
         )
         for key in CPA_KEYS:
@@ -375,45 +436,51 @@ def track_messages(messages, que, known_ship=None, stop_event=None,
         manoeuvring = False
         smooth_reports = base_profile.smooth_reports
         smoother = VelocitySmoother()
+        own_smoother = OwnVelocitySmoother()
         confirmations = {}  # mmsi -> consecutive dangerous position reports
+        ranges = RangeWatcher()
+
+        def dangerous(track, profile, at_time):
+            ranges.update(track.mmsi, at_time, track.distance)
+            if not dangerous_track(track, profile):
+                if (track.tcpa is not None and 0 < track.tcpa < profile.tcpa
+                        and (track.distance or 0) < profile.distance):
+                    log.info("No warning for MMSI %s: clearance %.0f m, tcpa %.1f min,"
+                             " distance %.0f m (limit %.0f m)", track.mmsi,
+                             (hull_clearance(track) or 0) * METERS_PER_NM, track.tcpa,
+                             track.distance * METERS_PER_NM, profile.cpa * METERS_PER_NM)
+                return False
+            if ranges.stalled(track.mmsi, at_time):
+                log.info("No warning for MMSI %s: range not closing", track.mmsi)
+                return False
+            return True
 
         def forget(track):
             smoother.forget(track.mmsi)
+            ranges.forget(track.mmsi)
             confirmations.pop(track.mmsi, None)
 
         def confirmed(track, profile):
             return confirmations.get(track.mmsi, 0) >= profile.confirm_reports
 
         tracker.register_callback(AISTrackEvent.DELETED, forget)
-        last_refresh = now()
-        for decoded in messages:
-            if stop_event is not None and stop_event.is_set():
-                break
+
+        def process(decoded):
+            """Track one decoded message; warn when it shows a dangerous CPA."""
             cpa_res = { "cpa": None, "tcpa": None, "distance": None, "bearing": None, "approaching_speed": None }
-            if known_ship is not None and settings.QUIET_MANOEUVRING:
-                if manoeuvre.update(known_ship.get_sog()) != manoeuvring:
-                    manoeuvring = manoeuvre.manoeuvring
-                    confirmations.clear()
-                    smooth_reports = (max(base_profile.smooth_reports,
-                                          HARBOUR_PROFILE.smooth_reports)
-                                      if manoeuvring else base_profile.smooth_reports)
             if decoded.msg_type in [1,2,3,18]:
                 lat = available("lat", decoded.lat)
                 lon = available("lon", decoded.lon)
                 if lat is None or lon is None:
-                    continue
+                    return
                 if known_ship is not None:
-                    if not position_in_range(
-                            lat, lon, known_ship.get_latitude(),
-                            known_ship.get_longitude()):
-                        continue
                     course, speed = smoother.update(
                         decoded.mmsi, available("course", decoded.course),
                         available("speed", decoded.speed), smooth_reports,
                         getattr(decoded, "status", None))
                     cpa_res = cpa_tcpa(
                         known_ship.get_mmsi(), known_ship.get_latitude(),
-                        known_ship.get_longitude(), *own_velocity(known_ship),
+                        known_ship.get_longitude(), *own_velocity(known_ship, own_smoother),
                         decoded.mmsi, lat, lon, course, speed,
                     )
                 log.debug("MMSI %s CPA result: %s", decoded.mmsi, cpa_res)
@@ -422,7 +489,7 @@ def track_messages(messages, que, known_ship=None, stop_event=None,
                 profile = (track_profile(track, base_profile, manoeuvring)
                            if track is not None else None)
                 if (known_ship is not None and profile is not None
-                        and dangerous_track(track, profile)):
+                        and dangerous(track, profile, now())):
                     confirmations[track.mmsi] = confirmations.get(track.mmsi, 0) + 1
                     if que is not None and confirmed(track, profile):
                         queue_warning(que, track, warning_enqueued, profile)
@@ -433,22 +500,32 @@ def track_messages(messages, que, known_ship=None, stop_event=None,
                 tracker.update(decoded, cpa_res)
                 log.debug("Updated non position message for MMSI %s", decoded.mmsi)
             else:
-                continue
+                return
             if track_callback is not None:
                 track = tracker.get_track(decoded.mmsi)
                 if track is not None:
                     track_callback("upsert", track)
+
+        last_refresh = now()
+        # None is a tick from with_ticks: no message, but time for periodic work
+        for decoded in messages:
+            if stop_event is not None and stop_event.is_set():
+                break
+            if known_ship is not None and settings.QUIET_MANOEUVRING:
+                if manoeuvre.update(known_ship.get_sog()) != manoeuvring:
+                    manoeuvring = manoeuvre.manoeuvring
+                    confirmations.clear()
+                    smooth_reports = (max(base_profile.smooth_reports,
+                                          HARBOUR_PROFILE.smooth_reports)
+                                      if manoeuvring else base_profile.smooth_reports)
+            if decoded is not None:
+                process(decoded)
             if known_ship is not None and now() - last_refresh >= CPA_REFRESH_SECONDS:
                 last_refresh = now()
                 for track in refresh_cpa(tracker, known_ship, last_refresh,
-                                         smoother, smooth_reports):
-                    if not position_in_range(
-                            track.lat, track.lon, known_ship.get_latitude(),
-                            known_ship.get_longitude()):
-                        confirmations.pop(track.mmsi, None)
-                        continue
+                                         smoother, smooth_reports, own_smoother):
                     profile = track_profile(track, base_profile, manoeuvring)
-                    if profile is None or not dangerous_track(track, profile):
+                    if profile is None or not dangerous(track, profile, last_refresh):
                         confirmations.pop(track.mmsi, None)
                     elif que is not None and confirmed(track, profile):
                         queue_warning(que, track, warning_enqueued, profile)
@@ -459,34 +536,91 @@ def track_messages(messages, que, known_ship=None, stop_event=None,
                 log.debug("Latest tracks: %s", latest_tracks)
                 live_print(latest_tracks)
 
+class _ReaderFailed:
+    """An exception raised in the reader thread, handed to the consumer."""
+
+    def __init__(self, error):
+        self.error = error
+
+
+_READER_DONE = object()
+
+
+def with_ticks(iterable, interval=TICK_SECONDS):
+    """Yield the items of iterable, and None whenever interval seconds pass
+    without one, so the caller can do periodic work while the stream is quiet.
+
+    The iterable is read in a daemon thread; an exception it raises is re-raised
+    here, and its end ends this generator."""
+    items = thread_queue.Queue()
+
+    def pump():
+        try:
+            for item in iterable:
+                items.put(item)
+            items.put(_READER_DONE)
+        except BaseException as error:  # handed to the consumer, raised there
+            items.put(_ReaderFailed(error))
+
+    threading.Thread(target=pump, name="ais-reader", daemon=True).start()
+    while True:
+        try:
+            item = items.get(timeout=interval)
+        except thread_queue.Empty:
+            yield None
+            continue
+        if item is _READER_DONE:
+            return
+        if isinstance(item, _ReaderFailed):
+            raise item.error
+        yield item
+
+
+def wake_reader(stream):
+    """Shut the stream's socket down so a reader thread blocked in recv returns."""
+    try:
+        stream._fobj.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass  # already closed or never connected
+
+
 def do_track(que, known_ship=None, stop_event=None,
              track_callback: Callable[[str, CPATrack], None] | None = None,
              host=HOST, port=PORT, ais_seen=None):
-    """tracking function"""
-    try:
-        with open_stream(host, port) as ais_stream:
-            messages = decoded_messages(ais_stream, ais_seen)
-            track_messages(chain.start.filter(messages), que,
+    """Track one connection until the stream ends, fails or stop_event is set.
+
+    KeyboardInterrupt propagates so the caller can shut down."""
+    with open_stream(host, port) as ais_stream:
+        try:
+            messages = chain.start.filter(decoded_messages(ais_stream, ais_seen))
+            track_messages(with_ticks(messages), que,
                            known_ship, stop_event, track_callback)
-    except KeyboardInterrupt:
-        log.info("Tracking process interrupted")
+        finally:
+            wake_reader(ais_stream)
 
 
-def run_warning_process(que, warning_dequeued=None):
+def run_warning_process(que, warning_dequeued=None, speech_language=SPEECH_LANGUAGE):
     """Keep terminal interrupts in the parent so it can shut workers down together."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
-    warn.do_warn(que, warning_dequeued)
+    # The parent's SIGTERM handler is inherited; terminate() must just end this process.
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    warn.do_warn(que, warning_dequeued, speech_language)
 
 
-def start_warning_process(que, warning_dequeued=None):
+def start_warning_process(que, warning_dequeued=None,
+                         speech_language=SPEECH_LANGUAGE):
     """Start a warning process reading que."""
-    process = Process(target=run_warning_process, args=(que, warning_dequeued),
-                      name="ais-warning")
+    process = Process(
+        target=run_warning_process,
+        args=(que, warning_dequeued, speech_language),
+        name="ais-warning",
+    )
     process.start()
     return process
 
 
-def supervise_warning_process(process, que, warning_dequeued=None):
+def supervise_warning_process(process, que, warning_dequeued=None,
+                              speech_language=SPEECH_LANGUAGE):
     """Return a running warning process, restarting it if it has died.
 
     Without it, tracking would go on silently with no spoken warnings."""
@@ -495,7 +629,7 @@ def supervise_warning_process(process, que, warning_dequeued=None):
     log.error("Warning process exited with code %s; restarting it", process.exitcode)
     process.join()
     free_reader_lock(que)
-    return start_warning_process(que, warning_dequeued)
+    return start_warning_process(que, warning_dequeued, speech_language)
 
 
 def free_reader_lock(que):
@@ -515,15 +649,18 @@ def free_reader_lock(que):
     log.error("Released the warning queue lock held by the dead warning process")
 
 
-def warning_supervisor(que, stop_event, interval=RECONNECT_SECONDS):
+def warning_supervisor(que, stop_event, interval=RECONNECT_SECONDS,
+                       speech_language=SPEECH_LANGUAGE):
     """Thread body: keep a warning process alive until stop_event is set.
 
     Returns a holder whose 'process' entry is the current warning process."""
-    holder = {"process": start_warning_process(que)}
+    holder = {"process": start_warning_process(que, speech_language=speech_language)}
 
     def watch():
         while not stop_event.wait(interval):
-            holder["process"] = supervise_warning_process(holder["process"], que)
+            holder["process"] = supervise_warning_process(
+                holder["process"], que, speech_language=speech_language
+            )
 
     return holder, watch
 
@@ -540,6 +677,9 @@ def track_forever(que, known_ship, stop_event, host=HOST, port=PORT, ais_seen=No
         except OSError as error:
             log.error("AIS stream %s:%s failed: %s; reconnecting in %s s",
                       host, port, error, RECONNECT_SECONDS)
+        except Exception:  # a bug must not end collision warnings for good
+            log.exception("AIS tracking failed; restarting in %s s",
+                          RECONNECT_SECONDS)
         stop_event.wait(RECONNECT_SECONDS)
 
 
@@ -563,6 +703,26 @@ def apply_mode_argument(args):
                 settings.NAVIGATION_MODE, profile.cpa * METERS_PER_NM, profile.tcpa)
 
 
+def add_speech_argument(parser):
+    """Add the global spoken-language selection."""
+    parser.add_argument(
+        "--speech-language",
+        choices=("en", "de"),
+        default=SPEECH_LANGUAGE,
+        help="announcement language and TTS engine: English Kokoro or German Piper "
+             f"(default: {SPEECH_LANGUAGE})",
+    )
+
+
+def apply_speech_argument(args):
+    """Validate and store the selected language for warning workers."""
+    global SPEECH_LANGUAGE
+    if args.speech_language not in ("en", "de"):
+        raise ValueError("speech language must be 'en' or 'de'")
+    SPEECH_LANGUAGE = args.speech_language
+    log.warning("Speech language %s", SPEECH_LANGUAGE)
+
+
 def setup_logging():
     """Log warnings and errors to a size-limited file beside this script (SD-card friendly)."""
     handler = logging.handlers.RotatingFileHandler(
@@ -572,19 +732,29 @@ def setup_logging():
     logging.basicConfig(level=logging.WARNING, handlers=[handler])
 
 
+def interrupt_on_sigterm(signum, frame):
+    """Turn SIGTERM (systemctl stop, kill) into the same clean shutdown as Ctrl-C."""
+    raise KeyboardInterrupt
+
+
 if __name__ == '__main__':
     import argparse
-    import threading
 
+    signal.signal(signal.SIGTERM, interrupt_on_sigterm)
     parser = argparse.ArgumentParser(description=__doc__)
     add_mode_argument(parser)
+    add_speech_argument(parser)
     cli_args = parser.parse_args()
     setup_logging()
     apply_mode_argument(cli_args)
-    my_ship = Ship(244030153, 53.264282, 7.397336, 0, 0.0, HOST, PORT)
+    apply_speech_argument(cli_args)
+    my_ship = Ship(settings.OWN_MMSI, settings.OWN_START_LAT,
+                   settings.OWN_START_LON, 0.0, 0.0)
     warn_que = Queue(MAX_MESSAGES)
     stop = threading.Event()
-    warning, watch_warning = warning_supervisor(warn_que, stop)
+    warning, watch_warning = warning_supervisor(
+        warn_que, stop, speech_language=SPEECH_LANGUAGE
+    )
     link_monitor = LinkMonitor(my_ship, warn_que)
     forced_warning_shutdown = False
 

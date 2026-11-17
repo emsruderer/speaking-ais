@@ -9,8 +9,12 @@ times smaller and faster than the full-precision model.
 """
 
 import os
+import queue
+import re
+import threading
 from pathlib import Path
 
+import numpy as np
 import onnxruntime as ort
 import sounddevice as sd
 from kokoro_onnx import Kokoro
@@ -21,12 +25,14 @@ MODEL_PATH = (INT8_MODEL_PATH if INT8_MODEL_PATH.is_file()
               else BASE_DIR / "kokoro-v1.0.onnx")
 VOICES_PATH = BASE_DIR / "voices-v1.0.bin"
 
+print(f"Using model: {MODEL_PATH}")
+print(f"Using voices: {VOICES_PATH}")
+
 VOICE = "af_heart"
 LANGUAGE = "en-us"
-SPEED = 0.8
-
-print(f"Using model: {MODEL_PATH}")
-print(f"Using voices: {VOICES_PATH}, language: {LANGUAGE}, speed: {SPEED}")
+SPEED = 0.7
+SAMPLE_RATE = 24000  # Kokoro output rate
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
 
 for asset_path in (MODEL_PATH, VOICES_PATH):
     if not asset_path.is_file():
@@ -171,15 +177,94 @@ def spell_callsign(callsign: str) -> str:
         raise ValueError(f"Unsupported callsign character: {error.args[0]!r}") from error
 
 
+class _Player:
+    """Keeps one output stream open and synthesizes sentences in a thread.
+
+    The stream plays silence between messages, so the audio device never goes
+    to sleep and clips the start of the next message. Playback of the first
+    sentence starts while later sentences are still being synthesized."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._started = False
+        self._jobs: queue.Queue = queue.Queue()
+        self._chunks: queue.Queue = queue.Queue()
+        self._current = None
+        self._position = 0
+        self._stream = None
+
+    def _ensure_started(self) -> None:
+        with self._lock:
+            if self._started:
+                return
+            self._stream = sd.OutputStream(
+                samplerate=SAMPLE_RATE,
+                channels=1,
+                dtype="float32",
+                callback=self._fill,
+            )
+            self._stream.start()
+            threading.Thread(target=self._synthesize, daemon=True).start()
+            self._started = True
+
+    def _fill(self, outdata, frames, time_info, status) -> None:
+        outdata.fill(0)
+        filled = 0
+        while filled < frames:
+            if self._current is None:
+                try:
+                    self._current = self._chunks.get_nowait()
+                except queue.Empty:
+                    return
+                self._position = 0
+            samples, done = self._current
+            count = min(frames - filled, len(samples) - self._position)
+            outdata[filled:filled + count, 0] = (
+                samples[self._position:self._position + count])
+            filled += count
+            self._position += count
+            if self._position >= len(samples):
+                if done is not None:
+                    done.set()
+                self._current = None
+
+    def _synthesize(self) -> None:
+        while True:
+            text, done, errors = self._jobs.get()
+            try:
+                for sentence in _SENTENCE_END.split(text.strip()):
+                    if not sentence.strip():
+                        continue
+                    samples, rate = tts.create(
+                        sentence,
+                        voice=VOICE,
+                        speed=SPEED,
+                        lang=LANGUAGE,
+                        trim=False,
+                    )
+                    if rate != SAMPLE_RATE:
+                        raise RuntimeError(f"Unexpected sample rate {rate}")
+                    self._chunks.put((samples.astype(np.float32), None))
+            except Exception as error:  # reported to the caller of speak()
+                errors.append(error)
+            self._chunks.put((np.zeros(0, dtype=np.float32), done))
+
+    def say(self, text: str) -> None:
+        self._ensure_started()
+        done = threading.Event()
+        errors: list = []
+        self._jobs.put((text, done, errors))
+        done.wait()
+        if errors:
+            raise errors[0]
+
+
+_player = _Player()
+
+
 def speak_tts(txt: str) -> None:
-    """Synthesize English speech and play the in-memory waveform."""
-    samples, sample_rate = tts.create(
-        txt,
-        voice=VOICE,
-        speed=SPEED,
-        lang=LANGUAGE,
-    )
-    sd.play(samples, sample_rate, blocking=True)
+    """Synthesize English speech and play it, returning when it has finished."""
+    _player.say(txt)
 
 
 def say_number(number: float) -> None:
